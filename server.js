@@ -1,5 +1,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const dns = require('node:dns');
+dns.setDefaultResultOrder('ipv4first');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -323,11 +325,12 @@ const dbConfig = {
 };
 
 const pool = mysql.createPool(dbConfig);
+const smtpHost = process.env.SMTP_HOST || '';
 const mailTransporter = process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASSWORD
   ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: process.env.SMTP_SECURE === 'true',
+      host: smtpHost,
+      port: Number(process.env.SMTP_PORT || 465),
+      secure: process.env.SMTP_SECURE !== 'false',
       family: 4,
       connectionTimeout: 10000,
       greetingTimeout: 10000,
