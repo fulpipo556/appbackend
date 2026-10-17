@@ -35,6 +35,15 @@ function upload(buffer, options) {
   });
 }
 
+function signedRawUrl(publicId) {
+  return cloudinary.url(publicId, {
+    secure: true,
+    sign_url: true,
+    resource_type: 'raw',
+    type: 'authenticated',
+  });
+}
+
 function localPath(storedPath) {
   if (!storedPath || !storedPath.startsWith('/uploads/')) return null;
   return path.join(uploadsDir, path.basename(storedPath));
@@ -141,19 +150,41 @@ async function migrateSpeakers(pool, cache) {
       update.photo_path = result.secure_url;
       update.photo_cloudinary_id = result.public_id;
     }
-    if (row.cv_file_path?.startsWith('/uploads/') && !row.cv_cloudinary_id) {
+    const existingCvSourcePath = row.cv_cloudinary_id
+      ? path.join(uploadsDir, path.basename(row.cv_cloudinary_id))
+      : null;
+    const existingCvNeedsMigration = Boolean(
+      existingCvSourcePath && fs.existsSync(existingCvSourcePath),
+    );
+    if (
+      row.cv_file_path?.startsWith('/uploads/')
+      || existingCvNeedsMigration
+    ) {
       const key = `speaker-cv:${row.cv_file_path}`;
+      const sourcePath = row.cv_file_path.startsWith('/uploads/')
+        ? row.cv_file_path
+        : `/uploads/${path.basename(row.cv_cloudinary_id)}`;
       const result = cache[key] || await upload(
-        await readStoredFile(row.cv_file_path),
+        await readStoredFile(sourcePath),
         {
           folder: `${cloudinaryFolder}/speakers`,
           resource_type: 'raw',
-          public_id: path.basename(row.cv_file_path),
+          type: 'authenticated',
+          overwrite: true,
+          public_id: row.cv_cloudinary_id
+            ? `speaker_cv_migrated_${row.id}_${Date.now()}.pdf`
+            : path.basename(sourcePath),
         },
       );
       cache[key] = result;
-      update.cv_file_path = result.secure_url;
+      update.cv_file_path = signedRawUrl(result.public_id);
       update.cv_cloudinary_id = result.public_id;
+    }
+    if (row.cv_cloudinary_id) {
+      const signedUrl = signedRawUrl(update.cv_cloudinary_id || row.cv_cloudinary_id);
+      if (row.cv_file_path !== signedUrl) {
+        update.cv_file_path = signedUrl;
+      }
     }
     if (update.photo_path || update.cv_file_path) {
       await pool.query(

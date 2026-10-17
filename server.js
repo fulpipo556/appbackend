@@ -52,16 +52,29 @@ function cloudinaryConfigured() {
   );
 }
 
-function uploadToCloudinary(buffer, { folder, resourceType = 'auto', publicId } = {}) {
+function uploadToCloudinary(
+  buffer,
+  { folder, resourceType = 'auto', publicId, type = 'upload' } = {},
+) {
   if (!cloudinaryConfigured()) {
     throw new Error('Cloudinary no está configurado en el backend');
   }
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
-      { folder, resource_type: resourceType, public_id: publicId },
+      { folder, resource_type: resourceType, type, public_id: publicId },
       (error, result) => error ? reject(error) : resolve(result)
     );
     stream.end(buffer);
+  });
+}
+
+function cloudinaryRawUrl(publicId) {
+  if (!publicId || !cloudinaryConfigured()) return '';
+  return cloudinary.url(publicId, {
+    secure: true,
+    sign_url: true,
+    resource_type: 'raw',
+    type: 'authenticated',
   });
 }
 
@@ -3388,9 +3401,15 @@ async function storeSpeakerFile(prefix, extension, buffer) {
   const result = await uploadToCloudinary(buffer, {
     folder: `${cloudinaryFolder}/speakers`,
     resourceType: prefix === 'speaker_photo' ? 'image' : 'raw',
+    type: prefix === 'speaker_photo' ? 'upload' : 'authenticated',
     publicId: `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${extension}`,
   });
-  return { url: result.secure_url, publicId: result.public_id };
+  return {
+    url: prefix === 'speaker_cv'
+      ? cloudinaryRawUrl(result.public_id)
+      : result.secure_url,
+    publicId: result.public_id,
+  };
 }
 
 async function removeStoredFile(storedPath) {
@@ -3404,7 +3423,7 @@ function serializeSpeaker(row) {
     name: row.name,
     photoPath: row.photo_path || '',
     cvFileName: row.cv_file_name || '',
-    cvFilePath: row.cv_file_path || '',
+    cvFilePath: cloudinaryRawUrl(row.cv_cloudinary_id) || row.cv_file_path || '',
     cvWordCount: Number(row.cv_word_count) || 0,
     activityCount: Number(row.activity_count) || 0,
   };
@@ -3413,7 +3432,8 @@ function serializeSpeaker(row) {
 async function sendSpeakers(_req, res) {
   try {
     const [rows] = await pool.query(`
-      SELECT s.id, s.name, s.photo_path, s.cv_file_name, s.cv_file_path, s.cv_word_count,
+      SELECT s.id, s.name, s.photo_path, s.cv_file_name, s.cv_file_path,
+             s.cv_cloudinary_id, s.cv_word_count,
              COUNT(aps.activity_id) AS activity_count
       FROM speakers s
       LEFT JOIN activity_speakers aps ON aps.speaker_id = s.id
@@ -3472,7 +3492,7 @@ app.post('/api/admin/speakers', authMiddleware, requireRole('admin'), handleSpea
       id: result.insertId,
     });
   } catch (error) {
-    await deleteCloudinaryAsset(photoPath?.publicId, 'raw');
+    await deleteCloudinaryAsset(photoPath?.publicId, 'image');
     await deleteCloudinaryAsset(cvPath?.publicId, 'raw');
     console.error('Error al guardar conferencista:', error);
     return res.status(500).json({ message: 'No se pudo guardar el conferencista' });
@@ -3537,7 +3557,7 @@ app.put('/api/admin/speakers/:id', authMiddleware, requireRole('admin'), handleS
     );
 
     if (newPhotoPath) {
-      await deleteCloudinaryAsset(current.photo_cloudinary_id, 'raw');
+      await deleteCloudinaryAsset(current.photo_cloudinary_id, 'image');
       await removeStoredFile(current.photo_path);
     }
     if (newCvPath) {
@@ -3546,7 +3566,7 @@ app.put('/api/admin/speakers/:id', authMiddleware, requireRole('admin'), handleS
     }
     return res.json({ message: 'Conferencista actualizado correctamente' });
   } catch (error) {
-    await deleteCloudinaryAsset(newPhotoPath?.publicId, 'raw');
+    await deleteCloudinaryAsset(newPhotoPath?.publicId, 'image');
     await deleteCloudinaryAsset(newCvPath?.publicId, 'raw');
     console.error('Error al actualizar conferencista:', error);
     return res.status(500).json({ message: 'No se pudo actualizar el conferencista' });
@@ -3572,7 +3592,7 @@ app.delete('/api/admin/speakers/:id', authMiddleware, requireRole('admin'), asyn
     await pool.query('DELETE FROM speakers WHERE id = ?', [speakerId]);
     await removeStoredFile(rows[0].photo_path);
     await removeStoredFile(rows[0].cv_file_path);
-    await deleteCloudinaryAsset(rows[0].photo_cloudinary_id, 'raw');
+    await deleteCloudinaryAsset(rows[0].photo_cloudinary_id, 'image');
     await deleteCloudinaryAsset(rows[0].cv_cloudinary_id, 'raw');
     return res.json({ message: 'Conferencista eliminado correctamente' });
   } catch (error) {
