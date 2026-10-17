@@ -10,7 +10,6 @@ const nodemailer = require('nodemailer');
 const multer = require('multer');
 const mysql = require('mysql2/promise');
 const mammoth = require('mammoth');
-const pdfParse = require('pdf-parse');
 const cheerio = require('cheerio');
 const { v2: cloudinary } = require('cloudinary');
 
@@ -78,10 +77,15 @@ function cloudinaryRawUrl(publicId) {
   });
 }
 
-async function deleteCloudinaryAsset(publicId, resourceType = 'image') {
+async function deleteCloudinaryAsset(
+  publicId,
+  resourceType = 'image',
+  type = resourceType === 'raw' ? 'authenticated' : 'upload',
+) {
   if (!publicId || !cloudinaryConfigured()) return;
   await cloudinary.uploader.destroy(publicId, {
     resource_type: resourceType,
+    type,
     invalidate: true,
   });
 }
@@ -3335,10 +3339,7 @@ function detectImageExtension(buffer) {
 }
 
 async function countCvWords(fileName, buffer) {
-  const extension = path.extname(String(fileName || '')).toLowerCase();
-  const text = extension === '.pdf'
-    ? (await pdfParse(buffer)).text
-    : (await mammoth.extractRawText({ buffer })).value;
+  const text = (await mammoth.extractRawText({ buffer })).value;
   return text.split(/\s+/).filter((word) => /[\p{L}\p{N}]/u.test(word)).length;
 }
 
@@ -3363,14 +3364,8 @@ async function prepareSpeakerFiles(req) {
     let validationMessage;
     if (extension === '.docx') {
       validationMessage = getDocxValidationError(cvFile.originalname, cvFile.buffer);
-    } else if (extension === '.pdf') {
-      if (!Buffer.isBuffer(cvFile.buffer) || cvFile.buffer.length === 0) {
-        validationMessage = 'El archivo PDF está vacío o no se pudo leer correctamente.';
-      } else if (cvFile.buffer.subarray(0, 5).toString('ascii') !== '%PDF-') {
-        validationMessage = 'El archivo tiene extensión .pdf, pero no es un PDF válido.';
-      }
     } else {
-      validationMessage = 'La hoja de vida debe ser un archivo Word (.docx) o PDF (.pdf).';
+      validationMessage = 'La hoja de vida debe ser un archivo Word (.docx) válido.';
     }
     if (validationMessage) return { error: validationMessage };
 
@@ -3402,7 +3397,7 @@ async function storeSpeakerFile(prefix, extension, buffer) {
     folder: `${cloudinaryFolder}/speakers`,
     resourceType: prefix === 'speaker_photo' ? 'image' : 'raw',
     type: prefix === 'speaker_photo' ? 'upload' : 'authenticated',
-    publicId: `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+    publicId: `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${extension}`,
   });
   return {
     url: prefix === 'speaker_cv'
@@ -3437,7 +3432,8 @@ async function sendSpeakers(_req, res) {
              COUNT(aps.activity_id) AS activity_count
       FROM speakers s
       LEFT JOIN activity_speakers aps ON aps.speaker_id = s.id
-      GROUP BY s.id, s.name, s.photo_path, s.cv_file_name, s.cv_file_path, s.cv_word_count
+      GROUP BY s.id, s.name, s.photo_path, s.cv_file_name, s.cv_file_path,
+               s.cv_cloudinary_id, s.cv_word_count
       ORDER BY s.name ASC
     `);
     return res.json({
@@ -3459,7 +3455,7 @@ app.post('/api/admin/speakers', authMiddleware, requireRole('admin'), handleSpea
   }
   if (!req.files?.photo?.[0] || !req.files?.cv?.[0]) {
     return res.status(400).json({
-      message: 'La foto y la hoja de vida (Word o PDF) son obligatorias',
+      message: 'La foto y la hoja de vida Word (.docx) son obligatorias',
     });
   }
 
