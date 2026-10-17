@@ -12,6 +12,7 @@ const mysql = require('mysql2/promise');
 const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
 const cheerio = require('cheerio');
+const { v2: cloudinary } = require('cloudinary');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -32,8 +33,45 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const uploadsDir = path.join(__dirname, 'uploads');
+const cloudinaryFolder = process.env.CLOUDINARY_FOLDER || 'fotosyhojas';
 fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
+
+function cloudinaryConfigured() {
+  return Boolean(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+    process.env.CLOUDINARY_API_KEY &&
+    process.env.CLOUDINARY_API_SECRET
+  );
+}
+
+function uploadToCloudinary(buffer, { folder, resourceType = 'auto', publicId } = {}) {
+  if (!cloudinaryConfigured()) {
+    throw new Error('Cloudinary no está configurado en el backend');
+  }
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, resource_type: resourceType, public_id: publicId },
+      (error, result) => error ? reject(error) : resolve(result)
+    );
+    stream.end(buffer);
+  });
+}
+
+async function deleteCloudinaryAsset(publicId, resourceType = 'image') {
+  if (!publicId || !cloudinaryConfigured()) return;
+  await cloudinary.uploader.destroy(publicId, {
+    resource_type: resourceType,
+    invalidate: true,
+  });
+}
 
 const wordFileFilter = (_req, file, cb) => {
   const allowed = ['.docx'];
@@ -66,15 +104,7 @@ const previewUpload = multer({
 });
 const sectionMaxFileSizeMb = Number(process.env.SECTION_MAX_FILE_SIZE || 500);
 const sectionUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadsDir),
-    filename: (_req, file, cb) => {
-      const safeName = file.originalname
-        .replace(/[^a-zA-Z0-9_.-]/g, '_')
-        .replace(/_+/g, '_');
-      cb(null, `${Date.now()}_${safeName}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: sectionMaxFileSizeMb * 1024 * 1024,
   },
@@ -817,8 +847,10 @@ async function initDatabase() {
 
   for (const [column, definition] of [
     ['photo_path', 'VARCHAR(255) NULL'],
+    ['photo_cloudinary_id', 'VARCHAR(255) NULL'],
     ['cv_file_name', 'VARCHAR(255) NULL'],
     ['cv_file_path', 'VARCHAR(255) NULL'],
+    ['cv_cloudinary_id', 'VARCHAR(255) NULL'],
     ['cv_word_count', 'INT UNSIGNED NOT NULL DEFAULT 0'],
   ]) {
     const [found] = await pool.query(`SHOW COLUMNS FROM speakers LIKE '${column}'`);
@@ -842,6 +874,7 @@ async function initDatabase() {
       activity_type_id INT NULL,
       file_name VARCHAR(255) NULL,
       file_path VARCHAR(255) NULL,
+      file_cloudinary_id VARCHAR(255) NULL,
       file_data MEDIUMBLOB NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       CONSTRAINT fk_activity_type FOREIGN KEY (activity_type_id)
@@ -850,7 +883,6 @@ async function initDatabase() {
         ON UPDATE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS content_sections (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -864,6 +896,23 @@ async function initDatabase() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
+  const [activityCloudColumn] = await pool.query(
+    "SHOW COLUMNS FROM activities LIKE 'file_cloudinary_id'"
+  );
+  if (activityCloudColumn.length === 0) {
+    await pool.query(
+      'ALTER TABLE activities ADD COLUMN file_cloudinary_id VARCHAR(255) NULL'
+    );
+  }
+  for (const [column, definition] of [
+    ['image_cloudinary_id', 'VARCHAR(255) NULL'],
+    ['video_cloudinary_id', 'VARCHAR(255) NULL'],
+  ]) {
+    const [found] = await pool.query(`SHOW COLUMNS FROM content_sections LIKE '${column}'`);
+    if (found.length === 0) {
+      await pool.query(`ALTER TABLE content_sections ADD COLUMN ${column} ${definition}`);
+    }
+  }
   const [sectionOrderColumn] = await pool.query(
     "SHOW COLUMNS FROM content_sections LIKE 'display_order'"
   );
@@ -2621,32 +2670,41 @@ app.post(
     const image = req.files?.image?.[0];
     const video = req.files?.video?.[0];
     if (videoUrl && !/^https?:\/\//i.test(videoUrl)) {
-      for (const file of [image, video].filter(Boolean)) {
-        await fs.promises.unlink(file.path).catch(() => {});
-      }
       return res.status(400).json({
         message: 'Agrega un título, texto, imagen o video. La URL del video debe ser válida.',
       });
     }
     try {
+      const uploadedImage = image
+        ? await uploadToCloudinary(image.buffer, {
+            folder: `${cloudinaryFolder}/sections`,
+            resourceType: 'image',
+          })
+        : null;
+      const uploadedVideo = video
+        ? await uploadToCloudinary(video.buffer, {
+            folder: `${cloudinaryFolder}/sections`,
+            resourceType: 'video',
+          })
+        : null;
       const [result] = await pool.query(
         `INSERT INTO content_sections
-         (title, body, image_path, video_path, video_url, display_order)
-         VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MIN(display_order) - 1
+         (title, body, image_path, video_path, video_url,
+          image_cloudinary_id, video_cloudinary_id, display_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT MIN(display_order) - 1
            FROM (SELECT display_order FROM content_sections) AS current_sections), 0))`,
         [
           title,
           body,
-          image ? `/uploads/${image.filename}` : null,
-          video ? `/uploads/${video.filename}` : null,
+          uploadedImage?.secure_url || null,
+          uploadedVideo?.secure_url || null,
           videoUrl || null,
+          uploadedImage?.public_id || null,
+          uploadedVideo?.public_id || null,
         ]
       );
       return res.status(201).json({ id: result.insertId });
     } catch (error) {
-      for (const file of [image, video].filter(Boolean)) {
-        await fs.promises.unlink(file.path).catch(() => {});
-      }
       console.error('Error al crear sección:', error);
       return res.status(500).json({ message: 'No se pudo crear la sección' });
     }
@@ -2668,41 +2726,47 @@ app.put(
     const removeImage = req.body.removeImage === 'true';
     const removeVideo = req.body.removeVideo === 'true';
     if (!Number.isInteger(id) || id < 1) {
-      for (const file of [image, video].filter(Boolean)) {
-        await fs.promises.unlink(file.path).catch(() => {});
-      }
       return res.status(400).json({ message: 'Sección inválida' });
     }
     if (videoUrl && !/^https?:\/\//i.test(videoUrl)) {
-      for (const file of [image, video].filter(Boolean)) {
-        await fs.promises.unlink(file.path).catch(() => {});
-      }
       return res.status(400).json({ message: 'La URL del video no es válida' });
     }
     try {
       const [rows] = await pool.query(
-        'SELECT image_path, video_path FROM content_sections WHERE id = ?',
+        `SELECT image_path, video_path, image_cloudinary_id,
+                video_cloudinary_id
+         FROM content_sections WHERE id = ?`,
         [id]
       );
       if (rows.length === 0) {
-        for (const file of [image, video].filter(Boolean)) {
-          await fs.promises.unlink(file.path).catch(() => {});
-        }
         return res.status(404).json({ message: 'Sección no encontrada' });
       }
+      const uploadedImage = image
+        ? await uploadToCloudinary(image.buffer, {
+            folder: `${cloudinaryFolder}/sections`,
+            resourceType: 'image',
+          })
+        : null;
+      const uploadedVideo = video
+        ? await uploadToCloudinary(video.buffer, {
+            folder: `${cloudinaryFolder}/sections`,
+            resourceType: 'video',
+          })
+        : null;
       const nextImagePath = image
-        ? `/uploads/${image.filename}`
+        ? uploadedImage.secure_url
         : removeImage
         ? null
         : rows[0].image_path;
       const nextVideoPath = video
-        ? `/uploads/${video.filename}`
+        ? uploadedVideo.secure_url
         : removeVideo
         ? null
         : rows[0].video_path;
       await pool.query(
         `UPDATE content_sections
          SET title = ?, body = ?, image_path = ?, video_path = ?, video_url = ?
+             , image_cloudinary_id = ?, video_cloudinary_id = ?
          WHERE id = ?`,
         [
           title,
@@ -2710,20 +2774,19 @@ app.put(
           nextImagePath,
           nextVideoPath,
           removeVideo ? null : videoUrl || null,
+          image ? uploadedImage.public_id : removeImage ? null : rows[0].image_cloudinary_id,
+          video ? uploadedVideo.public_id : removeVideo ? null : rows[0].video_cloudinary_id,
           id,
         ]
       );
-      for (const storedPath of [
-        (image || removeImage) ? rows[0].image_path : null,
-        (video || removeVideo) ? rows[0].video_path : null,
-      ].filter(Boolean)) {
-        await fs.promises.unlink(path.join(uploadsDir, path.basename(storedPath))).catch(() => {});
+      if (image || removeImage) {
+        await deleteCloudinaryAsset(rows[0].image_cloudinary_id, 'image');
+      }
+      if (video || removeVideo) {
+        await deleteCloudinaryAsset(rows[0].video_cloudinary_id, 'video');
       }
       return res.json({ message: 'Sección actualizada correctamente' });
     } catch (error) {
-      for (const file of [image, video].filter(Boolean)) {
-        await fs.promises.unlink(file.path).catch(() => {});
-      }
       console.error('Error al actualizar sección:', error);
       return res.status(500).json({ message: 'No se pudo actualizar la sección' });
     }
@@ -2788,12 +2851,18 @@ app.delete('/api/admin/sections/:id', authMiddleware, requireRole('admin'), asyn
   }
   try {
     const [rows] = await pool.query(
-      'SELECT image_path, video_path FROM content_sections WHERE id = ?',
+      `SELECT image_path, video_path, image_cloudinary_id,
+              video_cloudinary_id
+       FROM content_sections WHERE id = ?`,
       [id]
     );
     if (rows.length === 0) return res.status(404).json({ message: 'Sección no encontrada' });
     await pool.query('DELETE FROM content_sections WHERE id = ?', [id]);
-    for (const storedPath of [rows[0].image_path, rows[0].video_path].filter(Boolean)) {
+    await deleteCloudinaryAsset(rows[0].image_cloudinary_id, 'image');
+    await deleteCloudinaryAsset(rows[0].video_cloudinary_id, 'video');
+    for (const storedPath of [rows[0].image_path, rows[0].video_path].filter(
+      (value) => value && value.startsWith('/uploads/')
+    )) {
       await fs.promises.unlink(path.join(uploadsDir, path.basename(storedPath))).catch(() => {});
     }
     return res.json({ message: 'Sección eliminada' });
@@ -2892,7 +2961,21 @@ app.post('/api/admin/activities/batch', authMiddleware, requireRole('admin'), up
 
   const title = path.basename(req.file.originalname, path.extname(req.file.originalname))
     .slice(0, 200) || 'Agenda';
-  const filePath = `/uploads/${req.file.filename}`;
+  let uploadedDocument;
+  try {
+    uploadedDocument = await uploadToCloudinary(fileBuffer, {
+      folder: `${cloudinaryFolder}/activities`,
+      resourceType: 'raw',
+      publicId: `${path.basename(req.file.originalname, path.extname(req.file.originalname))}_${Date.now()}`,
+    });
+  } catch (error) {
+    await discardUpload();
+    console.error('Error al subir agenda a Cloudinary:', error);
+    return res.status(502).json({ message: 'No se pudo almacenar la agenda' });
+  }
+
+  const filePath = uploadedDocument.secure_url;
+  const fileCloudinaryId = uploadedDocument.public_id;
   let connection;
   try {
     connection = await pool.getConnection();
@@ -2908,7 +2991,7 @@ app.post('/api/admin/activities/batch', authMiddleware, requireRole('admin'), up
     for (let index = 0; index < normalizedActivities.length; index += 1) {
       const item = normalizedActivities[index];
       const [result] = await connection.query(
-        'INSERT INTO activities (activity, title, date, time, time_end, responsible, place, modality, file_name, file_path, file_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO activities (activity, title, date, time, time_end, responsible, place, modality, file_name, file_path, file_cloudinary_id, file_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         [
           item.activity,
           title,
@@ -2920,6 +3003,7 @@ app.post('/api/admin/activities/batch', authMiddleware, requireRole('admin'), up
           item.modality,
           req.file.originalname,
           filePath,
+          fileCloudinaryId,
           index === 0 ? fileBuffer : null,
         ]
       );
@@ -2934,10 +3018,12 @@ app.post('/api/admin/activities/batch', authMiddleware, requireRole('admin'), up
         modality: item.modality,
         file_name: req.file.originalname,
         file_path: filePath,
+        file_cloudinary_id: fileCloudinaryId,
       });
     }
 
     await connection.commit();
+    await discardUpload();
     return res.status(201).json({
       message: 'Agenda guardada correctamente',
       activities: savedActivities,
@@ -3072,7 +3158,7 @@ app.delete('/api/admin/activities/:id', authMiddleware, requireRole('admin'), as
 
   try {
     const [activities] = await pool.query(
-      'SELECT file_path FROM activities WHERE id = ?',
+      'SELECT file_path, file_cloudinary_id FROM activities WHERE id = ?',
       [activityId]
     );
     if (activities.length === 0) {
@@ -3088,8 +3174,11 @@ app.delete('/api/admin/activities/:id', authMiddleware, requireRole('admin'), as
         [filePath]
       );
       if (remainingActivities.length === 0) {
-        const storedPath = path.join(uploadsDir, path.basename(filePath));
-        await fs.promises.unlink(storedPath).catch(() => {});
+        await deleteCloudinaryAsset(activities[0].file_cloudinary_id, 'raw');
+        if (filePath?.startsWith('/uploads/')) {
+          const storedPath = path.join(uploadsDir, path.basename(filePath));
+          await fs.promises.unlink(storedPath).catch(() => {});
+        }
       }
     }
 
@@ -3130,6 +3219,7 @@ app.post('/api/admin/activities', authMiddleware, requireRole('admin'), upload.s
     }
 
     let fileData = null;
+    let uploadedDocument = null;
     if (req.file) {
       fileData = await fs.promises.readFile(req.file.path);
       const validationMessage = getDocxValidationError(req.file.originalname, fileData);
@@ -3137,11 +3227,23 @@ app.post('/api/admin/activities', authMiddleware, requireRole('admin'), upload.s
         await fs.promises.unlink(req.file.path).catch(() => {});
         return res.status(415).json({ message: validationMessage });
       }
+      uploadedDocument = await uploadToCloudinary(fileData, {
+        folder: `${cloudinaryFolder}/activities`,
+        resourceType: 'raw',
+        publicId: `${Date.now()}_${path.basename(req.file.originalname)}`,
+      });
+      await fs.promises.unlink(req.file.path).catch(() => {});
     }
 
     const [result] = await pool.query(
-      'INSERT INTO activities (activity, title, description, date, time, responsible, place, modality, activity_type_id, file_name, file_path, file_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [activity || title, title, description, date, `${time}:00`, responsible || null, place || null, modality, typeId, req.file?.originalname ?? null, req.file ? `/uploads/${req.file.filename}` : null, fileData]
+      `INSERT INTO activities
+       (activity, title, description, date, time, responsible, place, modality,
+        activity_type_id, file_name, file_path, file_cloudinary_id, file_data)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [activity || title, title, description, date, `${time}:00`,
+        responsible || null, place || null, modality, typeId,
+        req.file?.originalname ?? null, uploadedDocument?.secure_url || null,
+        uploadedDocument?.public_id || null, fileData]
     );
 
     const finalSpeakerIds = [...speakerIds];
@@ -3175,7 +3277,7 @@ app.post('/api/admin/activities', authMiddleware, requireRole('admin'), upload.s
         modality,
         type: typeName,
         fileName: req.file?.originalname ?? '',
-        filePath: req.file ? `/uploads/${req.file.filename}` : '',
+        filePath: uploadedDocument?.secure_url || '',
         speakers: finalSpeakerIds,
       },
     });
@@ -3283,9 +3385,12 @@ async function prepareSpeakerFiles(req) {
 }
 
 async function storeSpeakerFile(prefix, extension, buffer) {
-  const fileName = `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${extension}`;
-  await fs.promises.writeFile(path.join(uploadsDir, fileName), buffer);
-  return `/uploads/${fileName}`;
+  const result = await uploadToCloudinary(buffer, {
+    folder: `${cloudinaryFolder}/speakers`,
+    resourceType: prefix === 'speaker_photo' ? 'image' : 'raw',
+    publicId: `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${extension}`,
+  });
+  return { url: result.secure_url, publicId: result.public_id };
 }
 
 async function removeStoredFile(storedPath) {
@@ -3355,17 +3460,20 @@ app.post('/api/admin/speakers', authMiddleware, requireRole('admin'), handleSpea
     photoPath = await storeSpeakerFile('speaker_photo', files.photo.extension, files.photo.buffer);
     cvPath = await storeSpeakerFile('speaker_cv', files.cv.extension, files.cv.buffer);
     const [result] = await pool.query(
-      `INSERT INTO speakers (name, photo_path, cv_file_name, cv_file_path, cv_word_count)
-       VALUES (?, ?, ?, ?, ?)`,
-      [name, photoPath, files.cv.fileName, cvPath, files.cv.wordCount]
+      `INSERT INTO speakers
+       (name, photo_path, photo_cloudinary_id, cv_file_name, cv_file_path,
+        cv_cloudinary_id, cv_word_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [name, photoPath.url, photoPath.publicId, files.cv.fileName, cvPath.url,
+        cvPath.publicId, files.cv.wordCount]
     );
     return res.status(201).json({
       message: 'Conferencista guardado correctamente',
       id: result.insertId,
     });
   } catch (error) {
-    await removeStoredFile(photoPath);
-    await removeStoredFile(cvPath);
+    await deleteCloudinaryAsset(photoPath?.publicId, 'raw');
+    await deleteCloudinaryAsset(cvPath?.publicId, 'raw');
     console.error('Error al guardar conferencista:', error);
     return res.status(500).json({ message: 'No se pudo guardar el conferencista' });
   }
@@ -3413,24 +3521,33 @@ app.put('/api/admin/speakers/:id', authMiddleware, requireRole('admin'), handleS
 
     await pool.query(
       `UPDATE speakers
-       SET name = ?, photo_path = ?, cv_file_name = ?, cv_file_path = ?, cv_word_count = ?
+       SET name = ?, photo_path = ?, photo_cloudinary_id = ?, cv_file_name = ?,
+           cv_file_path = ?, cv_cloudinary_id = ?, cv_word_count = ?
        WHERE id = ?`,
       [
         name,
-        newPhotoPath ?? current.photo_path,
+        newPhotoPath?.url ?? current.photo_path,
+        newPhotoPath?.publicId ?? current.photo_cloudinary_id,
         files.cv ? files.cv.fileName : current.cv_file_name,
-        newCvPath ?? current.cv_file_path,
+        newCvPath?.url ?? current.cv_file_path,
+        newCvPath?.publicId ?? current.cv_cloudinary_id,
         files.cv ? files.cv.wordCount : current.cv_word_count,
         speakerId,
       ]
     );
 
-    if (newPhotoPath) await removeStoredFile(current.photo_path);
-    if (newCvPath) await removeStoredFile(current.cv_file_path);
+    if (newPhotoPath) {
+      await deleteCloudinaryAsset(current.photo_cloudinary_id, 'raw');
+      await removeStoredFile(current.photo_path);
+    }
+    if (newCvPath) {
+      await deleteCloudinaryAsset(current.cv_cloudinary_id, 'raw');
+      await removeStoredFile(current.cv_file_path);
+    }
     return res.json({ message: 'Conferencista actualizado correctamente' });
   } catch (error) {
-    await removeStoredFile(newPhotoPath);
-    await removeStoredFile(newCvPath);
+    await deleteCloudinaryAsset(newPhotoPath?.publicId, 'raw');
+    await deleteCloudinaryAsset(newCvPath?.publicId, 'raw');
     console.error('Error al actualizar conferencista:', error);
     return res.status(500).json({ message: 'No se pudo actualizar el conferencista' });
   }
@@ -3444,7 +3561,8 @@ app.delete('/api/admin/speakers/:id', authMiddleware, requireRole('admin'), asyn
 
   try {
     const [rows] = await pool.query(
-      'SELECT photo_path, cv_file_path FROM speakers WHERE id = ?',
+      `SELECT photo_path, cv_file_path, photo_cloudinary_id,
+              cv_cloudinary_id FROM speakers WHERE id = ?`,
       [speakerId]
     );
     if (rows.length === 0) {
@@ -3454,6 +3572,8 @@ app.delete('/api/admin/speakers/:id', authMiddleware, requireRole('admin'), asyn
     await pool.query('DELETE FROM speakers WHERE id = ?', [speakerId]);
     await removeStoredFile(rows[0].photo_path);
     await removeStoredFile(rows[0].cv_file_path);
+    await deleteCloudinaryAsset(rows[0].photo_cloudinary_id, 'raw');
+    await deleteCloudinaryAsset(rows[0].cv_cloudinary_id, 'raw');
     return res.json({ message: 'Conferencista eliminado correctamente' });
   } catch (error) {
     console.error('Error al eliminar conferencista:', error);
