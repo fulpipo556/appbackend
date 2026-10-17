@@ -3402,7 +3402,7 @@ async function storeSpeakerFile(prefix, extension, buffer) {
     folder: `${cloudinaryFolder}/speakers`,
     resourceType: prefix === 'speaker_photo' ? 'image' : 'raw',
     type: prefix === 'speaker_photo' ? 'upload' : 'authenticated',
-    publicId: `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${extension}`,
+    publicId: `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
   });
   return {
     url: prefix === 'speaker_cv'
