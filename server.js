@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
+const https = require('node:https');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
@@ -341,7 +342,222 @@ const mailTransporter = process.env.SMTP_HOST && process.env.SMTP_USER && proces
       },
     })
   : null;
+const gmailOAuthTransporter = process.env.GMAIL_CLIENT_ID &&
+      process.env.GMAIL_CLIENT_SECRET &&
+      process.env.GMAIL_REFRESH_TOKEN &&
+      process.env.GMAIL_USER
+    ? nodemailer.createTransport({
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
+        family: 4,
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
+        auth: {
+          type: 'OAuth2',
+          user: process.env.GMAIL_USER,
+          clientId: process.env.GMAIL_CLIENT_ID,
+          clientSecret: process.env.GMAIL_CLIENT_SECRET,
+          refreshToken: process.env.GMAIL_REFRESH_TOKEN,
+        },
+      })
+    : null;
+const gmailApiConfigured = Boolean(
+  process.env.GMAIL_CLIENT_ID &&
+  process.env.GMAIL_CLIENT_SECRET &&
+  process.env.GMAIL_REFRESH_TOKEN &&
+  process.env.GMAIL_USER
+);
+const resendApiKey = process.env.RESEND_API_KEY || '';
+const mailProvider = (process.env.MAIL_PROVIDER || '').trim().toLowerCase();
 const apiPublicUrl = (process.env.API_PUBLIC_URL || `http://localhost:${port}`).replace(/\/$/, '');
+
+function sendEmailWithResend(message) {
+  const from = process.env.RESEND_FROM || process.env.MAIL_FROM || '';
+  if (!resendApiKey || !from) {
+    return Promise.reject(new Error('El servicio Resend no está configurado'));
+  }
+
+  const payload = JSON.stringify({
+    from,
+    to: Array.isArray(message.to) ? message.to : [message.to],
+    subject: message.subject,
+    text: message.text,
+    html: message.html,
+  });
+
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: 'api.resend.com',
+      path: '/emails',
+      method: 'POST',
+      timeout: 15000,
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (response) => {
+      let responseBody = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve();
+          return;
+        }
+        reject(new Error(`Resend rechazó el correo (${response.statusCode}): ${responseBody}`));
+      });
+    });
+
+    request.on('timeout', () => {
+      request.destroy(new Error('Tiempo de espera agotado al conectar con Resend'));
+    });
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+function requestGoogleToken() {
+  const payload = new URLSearchParams({
+    client_id: process.env.GMAIL_CLIENT_ID,
+    client_secret: process.env.GMAIL_CLIENT_SECRET,
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+    grant_type: 'refresh_token',
+  }).toString();
+
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: 'oauth2.googleapis.com',
+      path: '/token',
+      method: 'POST',
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (response) => {
+      let responseBody = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+      response.on('end', () => {
+        let data;
+        try {
+          data = JSON.parse(responseBody);
+        } catch {
+          reject(new Error(`Google devolvió una respuesta inválida (${response.statusCode})`));
+          return;
+        }
+        if (response.statusCode >= 200 && response.statusCode < 300 && data.access_token) {
+          resolve(data.access_token);
+          return;
+        }
+        reject(new Error(`Google rechazó la autenticación (${response.statusCode}): ${data.error || 'error desconocido'}`));
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Tiempo de espera agotado al autenticar con Google')));
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+async function sendEmailWithGmailApi(message) {
+  if (!gmailApiConfigured) {
+    throw new Error(
+      'MAIL_PROVIDER=gmail_api requiere GMAIL_USER, GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET y GMAIL_REFRESH_TOKEN',
+    );
+  }
+  const headers = [
+    `From: ${message.from || process.env.GMAIL_USER}`,
+    `To: ${Array.isArray(message.to) ? message.to.join(', ') : message.to}`,
+    `Subject: =?UTF-8?B?${Buffer.from(message.subject || '').toString('base64')}?=`,
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/alternative; boundary="mail-boundary"',
+  ];
+  const mimeMessage = [
+    ...headers,
+    '',
+    '--mail-boundary',
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    message.text || '',
+    '--mail-boundary',
+    'Content-Type: text/html; charset="UTF-8"',
+    '',
+    message.html || message.text || '',
+    '--mail-boundary--',
+  ].join('\r\n');
+  const payload = JSON.stringify({
+    raw: Buffer.from(mimeMessage).toString('base64url'),
+  });
+  const accessToken = await requestGoogleToken();
+
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: 'gmail.googleapis.com',
+      path: '/gmail/v1/users/me/messages/send',
+      method: 'POST',
+      timeout: 15000,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (response) => {
+      let responseBody = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        responseBody += chunk;
+      });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve();
+          return;
+        }
+        reject(new Error(`Gmail API rechazó el correo (${response.statusCode}): ${responseBody}`));
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Tiempo de espera agotado al enviar con Gmail API')));
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+async function sendEmail(message) {
+  const normalizedMessage = {
+    ...message,
+    from: message.from || process.env.MAIL_FROM || process.env.GMAIL_USER || process.env.SMTP_USER,
+  };
+  if (mailProvider === 'resend' || resendApiKey) {
+    if (!resendApiKey) {
+      throw new Error('MAIL_PROVIDER=resend requiere configurar RESEND_API_KEY');
+    }
+    await sendEmailWithResend(normalizedMessage);
+    return;
+  }
+  if (mailProvider === 'gmail' || mailProvider === 'gmail_oauth2') {
+    if (!gmailOAuthTransporter) {
+      throw new Error(
+        'MAIL_PROVIDER=gmail requiere GMAIL_USER, GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET y GMAIL_REFRESH_TOKEN',
+      );
+    }
+    await gmailOAuthTransporter.sendMail(normalizedMessage);
+    return;
+  }
+  if (mailProvider === 'gmail_api') {
+    await sendEmailWithGmailApi(normalizedMessage);
+    return;
+  }
+  if (!mailTransporter) {
+    throw new Error('El servicio de correo no está configurado');
+  }
+  await mailTransporter.sendMail(normalizedMessage);
+}
 
 function hashValue(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -354,14 +570,10 @@ function safeHashEquals(left, right) {
 }
 
 async function sendVerificationEmail({ name, email, code, token }) {
-  if (!mailTransporter) {
-    throw new Error('El servicio SMTP no está configurado');
-  }
-
   const verificationUrl = new URL('/api/verify-email', apiPublicUrl);
   verificationUrl.searchParams.set('token', token);
 
-  await mailTransporter.sendMail({
+  await sendEmail({
     from: process.env.MAIL_FROM || process.env.SMTP_USER,
     to: email,
     subject: 'Confirma tu cuenta',
@@ -371,14 +583,10 @@ async function sendVerificationEmail({ name, email, code, token }) {
 }
 
 async function sendPasswordSetupEmail({ name, email, token }) {
-  if (!mailTransporter) {
-    throw new Error('El servicio de correo no está configurado');
-  }
-
   const setupUrl = new URL('/api/password-setup', apiPublicUrl);
   setupUrl.searchParams.set('token', token);
 
-  await mailTransporter.sendMail({
+  await sendEmail({
     from: process.env.MAIL_FROM || process.env.SMTP_USER,
     to: email,
     subject: 'Configura la contraseña de tu cuenta',
@@ -388,14 +596,10 @@ async function sendPasswordSetupEmail({ name, email, token }) {
 }
 
 async function sendPasswordResetEmail({ name, email, token }) {
-  if (!mailTransporter) {
-    throw new Error('El servicio de correo no está configurado');
-  }
-
   const resetUrl = new URL('/api/password-setup', apiPublicUrl);
   resetUrl.searchParams.set('token', token);
 
-  await mailTransporter.sendMail({
+  await sendEmail({
     from: process.env.MAIL_FROM || process.env.SMTP_USER,
     to: email,
     subject: 'Restablece tu contraseña',
@@ -4067,6 +4271,19 @@ app.use((error, _req, res, next) => {
 async function startServer() {
   try {
     await initDatabase();
+    console.log(
+      `Proveedor de correo: ${
+        mailProvider === 'resend' || resendApiKey
+          ? 'Resend API'
+          : mailProvider === 'gmail_api'
+            ? 'Gmail API'
+            : mailProvider === 'gmail' || mailProvider === 'gmail_oauth2'
+              ? 'Gmail OAuth2'
+            : mailTransporter
+              ? 'SMTP'
+              : 'no configurado'
+      }`,
+    );
     app.listen(port, '0.0.0.0', () => {
       console.log(`Servidor corriendo en el puerto ${port}`);
     });
