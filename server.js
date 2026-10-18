@@ -24,6 +24,10 @@ const adminEmails = new Set(
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean)
 );
+const appTimezoneOffset = process.env.APP_TIMEZONE_OFFSET || '-05:00';
+if (!/^[+-](?:0\d|1\d|2[0-3]):[0-5]\d$/.test(appTimezoneOffset)) {
+  throw new Error('APP_TIMEZONE_OFFSET debe tener formato ±HH:mm');
+}
 
 function roleForEmail(email, currentRole = 'teacher') {
   if (adminEmails.has(email.trim().toLowerCase())) return 'admin';
@@ -1878,11 +1882,15 @@ async function getAttendanceScheduleStatus(kind) {
             DATE_FORMAT(break_end, '%H:%i') AS break_end,
             attendance_enabled,
             break_enabled,
-            DATE_FORMAT(CURTIME(), '%H:%i') AS server_clock
+            DATE_FORMAT(
+              CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', ?),
+              '%H:%i'
+            ) AS app_clock
      FROM attendance_schedule_windows
-     WHERE event_date = CURDATE()`
+     WHERE event_date = DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', ?))`,
+    [appTimezoneOffset, appTimezoneOffset]
   );
-  const currentTime = schedules[0]?.server_clock;
+  const currentTime = schedules[0]?.app_clock;
   const openSchedule = schedules.find((schedule) =>
     isTimeWindowOpen(schedule, kind, currentTime));
   return {
