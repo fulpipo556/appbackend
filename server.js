@@ -372,6 +372,7 @@ const gmailApiConfigured = Boolean(
 const resendApiKey = process.env.RESEND_API_KEY || '';
 const mailProvider = (process.env.MAIL_PROVIDER || '').trim().toLowerCase();
 const apiPublicUrl = (process.env.API_PUBLIC_URL || `http://localhost:${port}`).replace(/\/$/, '');
+const emailServiceConfigured = Boolean(gmailApiConfigured || mailTransporter || resendApiKey);
 
 function sendEmailWithResend(message) {
   const from = process.env.RESEND_FROM || process.env.MAIL_FROM || '';
@@ -533,6 +534,10 @@ async function sendEmail(message) {
     ...message,
     from: message.from || process.env.MAIL_FROM || process.env.GMAIL_USER || process.env.SMTP_USER,
   };
+  if (gmailApiConfigured) {
+    await sendEmailWithGmailApi(normalizedMessage);
+    return;
+  }
   if (mailProvider === 'resend' || resendApiKey) {
     if (!resendApiKey) {
       throw new Error('MAIL_PROVIDER=resend requiere configurar RESEND_API_KEY');
@@ -553,7 +558,7 @@ async function sendEmail(message) {
     await sendEmailWithGmailApi(normalizedMessage);
     return;
   }
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     throw new Error('El servicio de correo no está configurado');
   }
   await mailTransporter.sendMail(normalizedMessage);
@@ -708,7 +713,7 @@ async function importTeacher({ name, email }) {
 }
 
 async function sendPasswordSetupInvitation(userId) {
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     throw new Error('El servicio de correo no está configurado');
   }
 
@@ -1287,7 +1292,7 @@ app.post('/api/register', async (req, res) => {
     return res.status(400).json({ message: 'Nombre, email y contraseña son obligatorios' });
   }
 
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     return res.status(503).json({ message: 'El servicio de correo no está configurado' });
   }
 
@@ -1341,7 +1346,7 @@ app.post('/api/resend-verification', async (req, res) => {
   if (!email) {
     return res.status(400).json({ message: 'Correo obligatorio' });
   }
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     return res.status(503).json({ message: 'El servicio de correo no está configurado' });
   }
 
@@ -1558,7 +1563,7 @@ app.post('/api/forgot-password', async (req, res) => {
     if (users.length === 0) {
       return res.json(genericResponse);
     }
-    if (!mailTransporter) {
+    if (!emailServiceConfigured) {
       return res.status(503).json({ message: 'El servicio de correo no está configurado' });
     }
 
@@ -2495,7 +2500,7 @@ app.post('/api/admin/users/:id/invitation', authMiddleware, requireRole('admin')
   if (!Number.isInteger(userId) || userId < 1) {
     return res.status(400).json({ message: 'Identificador de usuario inválido' });
   }
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     return res.status(503).json({ message: 'El servicio de correo no está configurado' });
   }
 
@@ -2527,7 +2532,7 @@ app.post('/api/admin/users/:id/invitation', authMiddleware, requireRole('admin')
 });
 
 app.post('/api/admin/users/invitations', authMiddleware, requireRole('admin'), async (_req, res) => {
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     return res.status(503).json({ message: 'El servicio de correo no está configurado' });
   }
 
@@ -2593,7 +2598,7 @@ app.post('/api/admin/users', authMiddleware, requireRole('admin'), async (req, r
       message: 'El nombre y un correo válido son obligatorios',
     });
   }
-  if (!mailTransporter) {
+  if (!emailServiceConfigured) {
     return res.status(503).json({ message: 'El servicio de correo no está configurado' });
   }
 
